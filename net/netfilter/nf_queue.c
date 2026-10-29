@@ -198,11 +198,14 @@ static int __nf_queue(struct sk_buff *skb, const struct nf_hook_state *state,
 	if (skb_sk_is_prefetched(skb)) {
 		struct sock *sk = skb->sk;
 
-		if (!sk_is_refcounted(sk)) {
+		if (!skb_sk_prefetched_is_refcounted(skb)) {
 			if (!refcount_inc_not_zero(&sk->sk_refcnt))
 				return -ENOTCONN;
 
 			/* drop refcount on skb_orphan */
+			skb->destructor = sock_edemux;
+		} else if (skb->destructor == sock_pfree_held) {
+			/* reference already held, drop it on skb_orphan */
 			skb->destructor = sock_edemux;
 		}
 	}

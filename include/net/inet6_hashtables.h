@@ -135,9 +135,14 @@ struct sock *inet6_steal_sock(struct net *net, struct sk_buff *skb, int doff,
 		return sk;
 
 	/* We've chosen a new reuseport sock which is never refcounted. This
-	 * implies that sk also isn't refcounted.
+	 * implies that sk also isn't refcounted, unless a reference was held
+	 * for it across a deferred receive. Drop it, reuse_sk is protected by
+	 * the RCU read-side section of the receive path.
 	 */
-	WARN_ON_ONCE(*refcounted);
+	if (*refcounted) {
+		sock_put(sk);
+		*refcounted = false;
+	}
 
 	return reuse_sk;
 }

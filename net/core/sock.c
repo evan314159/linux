@@ -2871,6 +2871,17 @@ void sock_pfree(struct sk_buff *skb)
 	sock_gen_put(sk);
 }
 EXPORT_SYMBOL(sock_pfree);
+
+/* Buffer destructor for prefetched sockets which are not refcounted, but
+ * for which a reference was taken because the skb leaves the RCU read-side
+ * section the socket was looked up in before it reaches the receive path,
+ * e.g. when it is queued to the backlog.
+ */
+void sock_pfree_held(struct sk_buff *skb)
+{
+	sock_put(skb->sk);
+}
+EXPORT_SYMBOL(sock_pfree_held);
 #endif /* CONFIG_INET */
 
 /*

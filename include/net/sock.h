@@ -1874,6 +1874,7 @@ void sock_efree(struct sk_buff *skb);
 #ifdef CONFIG_INET
 void sock_edemux(struct sk_buff *skb);
 void sock_pfree(struct sk_buff *skb);
+void sock_pfree_held(struct sk_buff *skb);
 
 static inline void skb_set_owner_edemux(struct sk_buff *skb, struct sock *sk)
 {
@@ -3022,7 +3023,8 @@ static inline bool
 skb_sk_is_prefetched(struct sk_buff *skb)
 {
 #ifdef CONFIG_INET
-	return skb->destructor == sock_pfree;
+	return skb->destructor == sock_pfree ||
+	       skb->destructor == sock_pfree_held;
 #else
 	return false;
 #endif /* CONFIG_INET */
@@ -3041,6 +3043,21 @@ sk_is_refcounted(struct sock *sk)
 {
 	/* Only full sockets have sk->sk_flags. */
 	return !sk_fullsock(sk) || !sock_flag(sk, SOCK_RCU_FREE);
+}
+
+/* Whether the prefetched socket of @skb holds a reference. Sockets which
+ * are not refcounted only hold one when the skb is processed outside of
+ * the RCU read-side section in which the socket was looked up, see
+ * sock_pfree_held().
+ */
+static inline bool
+skb_sk_prefetched_is_refcounted(struct sk_buff *skb)
+{
+#ifdef CONFIG_INET
+	if (skb->destructor == sock_pfree_held)
+		return true;
+#endif /* CONFIG_INET */
+	return sk_is_refcounted(skb->sk);
 }
 
 static inline bool
