@@ -31,12 +31,14 @@ struct netkit {
 	struct bpf_mprog_entry __rcu *active;
 	enum netkit_action policy;
 	enum netkit_scrub scrub;
+	bool xmit_ctx;
 	struct bpf_mprog_bundle	bundle;
 	__cacheline_group_end(netkit_fastpath);
 
 	__cacheline_group_begin(netkit_slowpath);
 	enum netkit_mode mode;
 	enum netkit_pairing pair;
+	enum netkit_bpf_ctx bpf_ctx;
 	bool primary;
 	u32 headroom;
 	__cacheline_group_end(netkit_slowpath);
@@ -51,22 +53,24 @@ static struct rtnl_link_ops netkit_link_ops;
 
 static __always_inline int
 netkit_run(const struct bpf_mprog_entry *entry, struct sk_buff *skb,
-	   enum netkit_action ret)
+	   enum netkit_action ret, bool rx)
 {
 	struct bpf_net_context *bpf_net_ctx = bpf_net_ctx_get();
 	const struct bpf_mprog_fp *fp;
 	const struct bpf_prog *prog;
-	struct sk_buff *prev;
+	struct sk_buff *prev = NULL;
 
 	/* skb->dev is the device the skb is handed to on NETKIT_PASS. */
-	prev = bpf_net_ctx_set_rx_skb(bpf_net_ctx, skb);
+	if (rx)
+		prev = bpf_net_ctx_set_rx_skb(bpf_net_ctx, skb);
 	bpf_mprog_foreach_prog(entry, fp, prog) {
 		bpf_compute_data_pointers(skb);
 		ret = bpf_prog_run(prog, skb);
 		if (ret != NETKIT_NEXT)
 			break;
 	}
-	bpf_net_ctx_restore_rx_skb(bpf_net_ctx, prev);
+	if (rx)
+		bpf_net_ctx_restore_rx_skb(bpf_net_ctx, prev);
 	return ret;
 }
 
@@ -89,20 +93,30 @@ static void netkit_prep_forward(struct sk_buff *skb,
 		netkit_xnet(skb);
 }
 
+static void netkit_switch_peer(struct sk_buff *skb, struct net_device *peer,
+			       bool xnet, bool xnet_scrub)
+{
+	netkit_prep_forward(skb, xnet, xnet_scrub);
+	eth_skb_pkt_type(skb, peer);
+	skb->dev = peer;
+}
+
 static struct netkit *netkit_priv(const struct net_device *dev)
 {
 	return netdev_priv(dev);
 }
 
-static netdev_tx_t netkit_xmit(struct sk_buff *skb, struct net_device *dev)
+static __always_inline netdev_tx_t
+__netkit_xmit(struct sk_buff *skb, struct net_device *dev, struct netkit *nk,
+	      const bool primary_ctx)
 {
 	struct bpf_net_context __bpf_net_ctx, *bpf_net_ctx;
-	struct netkit *nk = netkit_priv(dev);
 	enum netkit_action ret = READ_ONCE(nk->policy);
 	netdev_tx_t ret_dev = NET_XMIT_SUCCESS;
 	const struct bpf_mprog_entry *entry;
 	struct net_device *peer;
 	int len = skb->len;
+	bool xnet;
 
 	bpf_net_ctx = bpf_net_ctx_set(&__bpf_net_ctx);
 	rcu_read_lock();
@@ -111,16 +125,21 @@ static netdev_tx_t netkit_xmit(struct sk_buff *skb, struct net_device *dev)
 		     !pskb_may_pull(skb, ETH_HLEN) ||
 		     skb_orphan_frags(skb, GFP_ATOMIC)))
 		goto drop;
-	netkit_prep_forward(skb, !net_eq(dev_net(dev), dev_net(peer)),
-			    nk->scrub);
-	eth_skb_pkt_type(skb, peer);
-	skb->dev = peer;
+	xnet = !net_eq(dev_net(dev), dev_net(peer));
+	/* With NETKIT_BPF_CTX_PRIMARY, the programs run with skb->dev still
+	 * set to the primary, and the switch to the peer is deferred to the
+	 * verdict.
+	 */
+	if (!primary_ctx)
+		netkit_switch_peer(skb, peer, xnet, nk->scrub);
 	entry = rcu_dereference(nk->active);
 	if (entry)
-		ret = netkit_run(entry, skb, ret);
+		ret = netkit_run(entry, skb, ret, !primary_ctx);
 	switch (ret) {
 	case NETKIT_NEXT:
 	case NETKIT_PASS:
+		if (primary_ctx)
+			netkit_switch_peer(skb, peer, xnet, nk->scrub);
 		eth_skb_pull_mac(skb);
 		skb_postpull_rcsum(skb, eth_hdr(skb), ETH_HLEN);
 		if (likely(__netif_rx(skb) == NET_RX_SUCCESS)) {
@@ -146,6 +165,18 @@ drop_stats:
 	rcu_read_unlock();
 	bpf_net_ctx_clear(bpf_net_ctx);
 	return ret_dev;
+}
+
+static netdev_tx_t netkit_xmit(struct sk_buff *skb, struct net_device *dev)
+{
+	struct netkit *nk = netkit_priv(dev);
+
+	/* __netkit_xmit() is inlined once for each context, so that neither
+	 * copy tests the context again per packet.
+	 */
+	if (unlikely(nk->xmit_ctx))
+		return __netkit_xmit(skb, dev, nk, true);
+	return __netkit_xmit(skb, dev, nk, false);
 }
 
 static int netkit_open(struct net_device *dev)
@@ -534,6 +565,7 @@ static int netkit_new_link(struct net_device *dev,
 	enum netkit_scrub scrub_peer = NETKIT_SCRUB_DEFAULT;
 	struct nlattr *peer_tb[IFLA_MAX + 1], **tbp, *attr;
 	enum netkit_pairing pair = NETKIT_DEVICE_PAIR;
+	enum netkit_bpf_ctx bpf_ctx = NETKIT_BPF_CTX_RX;
 	enum netkit_action policy_prim = NETKIT_PASS;
 	enum netkit_action policy_peer = NETKIT_PASS;
 	bool seen_peer = false, seen_scrub = false;
@@ -582,6 +614,8 @@ static int netkit_new_link(struct net_device *dev,
 			tailroom = nla_get_u16(data[IFLA_NETKIT_TAILROOM]);
 		if (data[IFLA_NETKIT_PAIRING])
 			pair = nla_get_u32(data[IFLA_NETKIT_PAIRING]);
+		if (data[IFLA_NETKIT_BPF_CTX])
+			bpf_ctx = nla_get_u32(data[IFLA_NETKIT_BPF_CTX]);
 
 		seen_scrub = data[IFLA_NETKIT_SCRUB];
 		seen_peer = data[IFLA_NETKIT_PEER_INFO] ||
@@ -601,7 +635,7 @@ static int netkit_new_link(struct net_device *dev,
 		return -EOPNOTSUPP;
 	if (pair == NETKIT_DEVICE_SINGLE &&
 	    (tb != tbp || seen_peer || seen_scrub ||
-	     policy_prim != NETKIT_PASS))
+	     policy_prim != NETKIT_PASS || bpf_ctx != NETKIT_BPF_CTX_RX))
 		return -EOPNOTSUPP;
 
 	if (pair == NETKIT_DEVICE_PAIR) {
@@ -626,6 +660,7 @@ static int netkit_new_link(struct net_device *dev,
 		nk->scrub = scrub_peer;
 		nk->mode = mode;
 		nk->pair = pair;
+		nk->bpf_ctx = bpf_ctx;
 		nk->headroom = headroom;
 		bpf_mprog_bundle_init(&nk->bundle);
 
@@ -656,8 +691,10 @@ static int netkit_new_link(struct net_device *dev,
 	nk->primary = true;
 	nk->policy = policy_prim;
 	nk->scrub = scrub_prim;
+	nk->xmit_ctx = bpf_ctx == NETKIT_BPF_CTX_PRIMARY;
 	nk->mode = mode;
 	nk->pair = pair;
+	nk->bpf_ctx = bpf_ctx;
 	nk->headroom = headroom;
 	bpf_mprog_bundle_init(&nk->bundle);
 
@@ -1110,6 +1147,7 @@ static int netkit_change_link(struct net_device *dev, struct nlattr *tb[],
 		{ IFLA_NETKIT_HEADROOM,   "headroom" },
 		{ IFLA_NETKIT_TAILROOM,   "tailroom" },
 		{ IFLA_NETKIT_PAIRING,    "pairing" },
+		{ IFLA_NETKIT_BPF_CTX,    "BPF context" },
 	};
 
 	if (!nk->primary) {
@@ -1209,6 +1247,7 @@ static size_t netkit_get_size(const struct net_device *dev)
 	       nla_total_size(sizeof(u16)) + /* IFLA_NETKIT_HEADROOM */
 	       nla_total_size(sizeof(u16)) + /* IFLA_NETKIT_TAILROOM */
 	       nla_total_size(sizeof(u32)) + /* IFLA_NETKIT_PAIRING */
+	       nla_total_size(sizeof(u32)) + /* IFLA_NETKIT_BPF_CTX */
 	       0;
 }
 
@@ -1231,6 +1270,9 @@ static int netkit_fill_info(struct sk_buff *skb, const struct net_device *dev)
 	if (nla_put_u16(skb, IFLA_NETKIT_TAILROOM, dev->needed_tailroom))
 		return -EMSGSIZE;
 	if (nla_put_u32(skb, IFLA_NETKIT_PAIRING, nk->pair))
+		return -EMSGSIZE;
+	if (nk->pair == NETKIT_DEVICE_PAIR &&
+	    nla_put_u32(skb, IFLA_NETKIT_BPF_CTX, nk->bpf_ctx))
 		return -EMSGSIZE;
 
 	rcu_read_lock();
@@ -1259,6 +1301,7 @@ static const struct nla_policy netkit_policy[IFLA_NETKIT_MAX + 1] = {
 	[IFLA_NETKIT_SCRUB]		= NLA_POLICY_MAX(NLA_U32, NETKIT_SCRUB_DEFAULT),
 	[IFLA_NETKIT_PEER_SCRUB]	= NLA_POLICY_MAX(NLA_U32, NETKIT_SCRUB_DEFAULT),
 	[IFLA_NETKIT_PAIRING]		= NLA_POLICY_MAX(NLA_U32, NETKIT_DEVICE_SINGLE),
+	[IFLA_NETKIT_BPF_CTX]		= NLA_POLICY_MAX(NLA_U32, NETKIT_BPF_CTX_PRIMARY),
 	[IFLA_NETKIT_PRIMARY]		= { .type = NLA_REJECT,
 					    .reject_message = "Primary attribute is read-only" },
 };

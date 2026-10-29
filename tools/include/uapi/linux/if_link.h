@@ -1293,6 +1293,11 @@ enum netkit_mode {
 	NETKIT_L3,
 };
 
+enum netkit_pairing {
+	NETKIT_DEVICE_PAIR,
+	NETKIT_DEVICE_SINGLE,
+};
+
 /* NETKIT_SCRUB_NONE leaves clearing skb->{mark,priority} up to
  * the BPF program if attached. This also means the latter can
  * consume the two fields if they were populated earlier.
@@ -1306,6 +1311,24 @@ enum netkit_scrub {
 	NETKIT_SCRUB_DEFAULT,
 };
 
+/* NETKIT_BPF_CTX_RX runs the BPF programs of a device in the context of
+ * the device the skb is handed to on NETKIT_PASS, i.e. its peer: skb->dev
+ * is the peer, and helpers such as bpf_redirect() or bpf_fib_lookup()
+ * resolve against the peer's network namespace. This is the default
+ * behavior.
+ *
+ * NETKIT_BPF_CTX_PRIMARY runs the BPF programs of the primary device with
+ * skb->dev set to the primary device itself, so that helpers resolve
+ * against its network namespace, and defers the switch over to the peer,
+ * including scrubbing of skb->{mark,priority}, to a NETKIT_PASS verdict.
+ * The programs of the peer device are unaffected, as skb->dev is already
+ * the primary device for them.
+ */
+enum netkit_bpf_ctx {
+	NETKIT_BPF_CTX_RX,
+	NETKIT_BPF_CTX_PRIMARY,
+};
+
 enum {
 	IFLA_NETKIT_UNSPEC,
 	IFLA_NETKIT_PEER_INFO,
@@ -1317,6 +1340,8 @@ enum {
 	IFLA_NETKIT_PEER_SCRUB,
 	IFLA_NETKIT_HEADROOM,
 	IFLA_NETKIT_TAILROOM,
+	IFLA_NETKIT_PAIRING,
+	IFLA_NETKIT_BPF_CTX,
 	__IFLA_NETKIT_MAX,
 };
 #define IFLA_NETKIT_MAX	(__IFLA_NETKIT_MAX - 1)

@@ -840,6 +840,13 @@ definitions:
       - name: pair
       - name: single
   -
+    name: netkit-bpf-ctx
+    type: enum
+    enum-name: netkit-bpf-ctx
+    entries:
+      - name: rx
+      - name: primary
+  -
     name: ovpn-mode
     enum-name: ovpn-mode
     name-prefix: ovpn-mode-
@@ -2360,6 +2367,10 @@ attribute-sets:
         name: pairing
         type: u32
         enum: netkit-pairing
+      -
+        name: bpf-ctx
+        type: u32
+        enum: netkit-bpf-ctx
   -
     name: linkinfo-ovpn-attrs
     name-prefix: ifla-ovpn-
