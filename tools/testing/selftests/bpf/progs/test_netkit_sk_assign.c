@@ -23,6 +23,8 @@ int nr_assigned;
 
 int primary_assign_ret = 1;
 __u32 primary_ifindex;
+__u32 redirect_ifindex;
+int nr_redirected;
 
 char _license[] SEC("license") = "GPL";
 
@@ -124,7 +126,7 @@ static bool is_test_udp4(struct __sk_buff *skb)
 }
 
 SEC("netkit/primary")
-int primary_assign(struct __sk_buff *skb)
+int primary_ctx(struct __sk_buff *skb)
 {
 	struct bpf_sock *sk;
 	const int zero = 0;
@@ -133,10 +135,23 @@ int primary_assign(struct __sk_buff *skb)
 		return TC_ACT_OK;
 
 	primary_ifindex = skb->ifindex;
+
 	sk = bpf_map_lookup_elem(&server_map, &zero);
 	if (sk) {
 		primary_assign_ret = bpf_sk_assign(skb, sk, 0);
 		bpf_sk_release(sk);
 	}
+
+	if (redirect_ifindex)
+		return bpf_redirect(redirect_ifindex, 0);
 	return TC_ACT_OK;
+}
+
+SEC("tcx/ingress")
+int redirect_target(struct __sk_buff *skb)
+{
+	if (!is_test_udp4(skb))
+		return TC_ACT_OK;
+	__sync_fetch_and_add(&nr_redirected, 1);
+	return TC_ACT_SHOT;
 }

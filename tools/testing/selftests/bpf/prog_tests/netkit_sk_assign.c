@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Test bpf_sk_assign() from netkit programs. netkit runs them from its
- * xmit path, and on NETKIT_PASS queues the skb to the backlog of the
- * other device of the pair before it reaches the assigned socket.
+ * Test bpf_sk_assign() from netkit programs, which run on the xmit path
+ * and hand the skb to the backlog of the peer device, and
+ * IFLA_NETKIT_BPF_CTX, which controls the context that programs of the
+ * primary device run in.
  */
 #include <uapi/linux/if_link.h>
 #include <net/if.h>
@@ -17,6 +18,8 @@
 #define NS_POD		"nk_sk_pod"
 #define NK_PRIMARY	"nk1"
 #define NK_PEER		"nk0"
+#define VETH_SRC	"veth_src"
+#define VETH_DST	"veth_dst"
 
 #define BIND_PORT	1234
 #define CONNECT_PORT	4321
@@ -32,7 +35,7 @@ struct iplink_req {
 	char             buf[1024];
 };
 
-static int create_netkit(void)
+static int create_netkit(int bpf_ctx)
 {
 	struct rtnl_handle rth = { .fd = -1 };
 	struct iplink_req req = {};
@@ -55,6 +58,7 @@ static int create_netkit(void)
 	addattr_l(&req.n, sizeof(req), IFLA_INFO_KIND, type, strlen(type));
 	data = addattr_nest(&req.n, sizeof(req), IFLA_INFO_DATA);
 	addattr32(&req.n, sizeof(req), IFLA_NETKIT_MODE, NETKIT_L3);
+	addattr32(&req.n, sizeof(req), IFLA_NETKIT_BPF_CTX, bpf_ctx);
 	addattr_nest_end(&req.n, data);
 	addattr_nest_end(&req.n, linkinfo);
 
@@ -69,7 +73,7 @@ static int create_netkit(void)
  * so the pod only reaches the server bound to BIND_PORT via
  * bpf_sk_assign() from the peer program.
  */
-static struct nstoken *setup(void)
+static struct nstoken *setup(int bpf_ctx)
 {
 	struct nstoken *tok;
 
@@ -83,7 +87,14 @@ static struct nstoken *setup(void)
 	SYS(fail_close, "ip link set dev lo up");
 	SYS(fail_close, "sysctl -wq net.ipv4.conf.all.rp_filter=0");
 	SYS(fail_close, "sysctl -wq net.ipv4.conf.default.rp_filter=0");
-	if (create_netkit())
+	/* Create before netkit, so that the ifindex of VETH_SRC cannot
+	 * exist in the pod netns.
+	 */
+	SYS(fail_close, "ip link add " VETH_SRC " type veth peer name " VETH_DST);
+	SYS(fail_close, "ip link set dev " VETH_SRC " up");
+	SYS(fail_close, "ip link set dev " VETH_DST " up");
+
+	if (create_netkit(bpf_ctx))
 		goto fail_close;
 
 	SYS(fail_close, "ip link set dev " NK_PEER " netns " NS_POD);
@@ -148,7 +159,7 @@ static void run_sk_assign(int family, int type, int nr_listen)
 	int ifindex, zero = 0;
 	__u64 fd;
 
-	tok = setup();
+	tok = setup(NETKIT_BPF_CTX_RX);
 	if (!tok)
 		return;
 
@@ -220,21 +231,19 @@ out:
 	cleanup(tok);
 }
 
-/* Programs of the primary device run with skb->dev set to the peer, in
- * the pod netns. On NETKIT_PASS the skb is received there, so a socket
- * of the host netns must not be assignable.
- */
-static void run_primary_netns(void)
+static void run_primary_ctx(int bpf_ctx)
 {
+	bool primary = bpf_ctx == NETKIT_BPF_CTX_PRIMARY;
 	LIBBPF_OPTS(bpf_netkit_opts, optl);
+	LIBBPF_OPTS(bpf_tcx_opts, optt);
 	struct test_netkit_sk_assign *skel;
-	int peer_ifindex, server = -1, client = -1, zero = 0;
-	struct nstoken *tok, *pod;
-	char buf[] = "testing";
-	struct bpf_link *link;
+	int ifindex, peer_ifindex, server = -1, client = -1, zero = 0, i;
 	__u64 fd;
+	struct nstoken *tok, *pod;
+	struct bpf_link *link;
+	char buf[] = "testing";
 
-	tok = setup();
+	tok = setup(bpf_ctx);
 	if (!tok)
 		return;
 
@@ -242,6 +251,9 @@ static void run_primary_netns(void)
 	if (!ASSERT_OK_PTR(skel, "skel_open_and_load"))
 		goto out;
 
+	ifindex = if_nametoindex(NK_PRIMARY);
+	if (!ASSERT_GT(ifindex, 0, "nk_ifindex"))
+		goto out;
 	pod = open_netns(NS_POD);
 	if (!ASSERT_OK_PTR(pod, "open_netns_pod"))
 		goto out;
@@ -250,12 +262,18 @@ static void run_primary_netns(void)
 	if (!ASSERT_GT(peer_ifindex, 0, "nk_peer_ifindex"))
 		goto out;
 
-	link = bpf_program__attach_netkit(skel->progs.primary_assign,
-					  if_nametoindex(NK_PRIMARY), &optl);
+	skel->bss->redirect_ifindex = if_nametoindex(VETH_SRC);
+	link = bpf_program__attach_netkit(skel->progs.primary_ctx, ifindex, &optl);
 	if (!ASSERT_OK_PTR(link, "attach_primary"))
 		goto out;
-	skel->links.primary_assign = link;
+	skel->links.primary_ctx = link;
+	link = bpf_program__attach_tcx(skel->progs.redirect_target,
+				       if_nametoindex(VETH_DST), &optt);
+	if (!ASSERT_OK_PTR(link, "attach_tcx"))
+		goto out;
+	skel->links.redirect_target = link;
 
+	/* A host socket, which the primary programs must not assign. */
 	server = start_server(AF_INET, SOCK_DGRAM, "127.0.0.1", BIND_PORT,
 			      TIMEOUT_MS);
 	if (!ASSERT_GE(server, 0, "start_server"))
@@ -273,9 +291,16 @@ static void run_primary_netns(void)
 	if (!ASSERT_EQ(write(client, buf, sizeof(buf)), sizeof(buf), "write"))
 		goto out;
 
-	ASSERT_EQ(skel->bss->primary_ifindex, peer_ifindex, "primary_ifindex");
-	ASSERT_EQ(skel->data->primary_assign_ret, -ENETUNREACH,
-		  "primary_assign_ret");
+	/* With NETKIT_BPF_CTX_RX, programs of the primary run on the peer in
+	 * the pod netns, so the ifindex of the host device does not resolve.
+	 */
+	ASSERT_EQ(skel->bss->primary_ifindex, primary ? ifindex : peer_ifindex,
+		  "primary_ifindex");
+	for (i = 0; primary && i < 100 && !READ_ONCE(skel->bss->nr_redirected); i++)
+		usleep(1000);
+	ASSERT_EQ(skel->bss->nr_redirected, primary ? 1 : 0, "nr_redirected");
+	ASSERT_EQ(skel->data->primary_assign_ret,
+		  primary ? -EOPNOTSUPP : -ENETUNREACH, "primary_assign_ret");
 out:
 	if (client >= 0)
 		close(client);
@@ -299,6 +324,8 @@ void serial_test_netkit_sk_assign(void)
 		run_sk_assign(AF_INET, SOCK_STREAM, 2);
 	if (test__start_subtest("ipv4_udp_reuseport"))
 		run_sk_assign(AF_INET, SOCK_DGRAM, 2);
-	if (test__start_subtest("primary_netns"))
-		run_primary_netns();
+	if (test__start_subtest("bpf_ctx_rx"))
+		run_primary_ctx(NETKIT_BPF_CTX_RX);
+	if (test__start_subtest("bpf_ctx_primary"))
+		run_primary_ctx(NETKIT_BPF_CTX_PRIMARY);
 }
