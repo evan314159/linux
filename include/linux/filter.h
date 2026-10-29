@@ -876,6 +876,7 @@ struct bpf_nh_params {
 #define BPF_RI_F_CPU_MAP_INIT	BIT(2)
 #define BPF_RI_F_DEV_MAP_INIT	BIT(3)
 #define BPF_RI_F_XSK_MAP_INIT	BIT(4)
+#define BPF_RI_F_RX_SKB		BIT(5)
 
 struct bpf_redirect_info {
 	u64 tgt_index;
@@ -893,6 +894,7 @@ struct bpf_net_context {
 	struct list_head cpu_map_flush_list;
 	struct list_head dev_map_flush_list;
 	struct list_head xskmap_map_flush_list;
+	struct sk_buff *rx_skb;
 };
 
 static inline struct bpf_net_context *bpf_net_ctx_set(struct bpf_net_context *bpf_net_ctx)
@@ -964,6 +966,40 @@ static inline struct list_head *bpf_net_ctx_get_xskmap_flush_list(void)
 	}
 
 	return &bpf_net_ctx->xskmap_map_flush_list;
+}
+
+/* Outside of tc ingress, mark @skb as one which is handed to the receive
+ * path of skb->dev once the BPF program returns, e.g. by netkit. Returns
+ * the previously marked skb, to be passed to bpf_net_ctx_restore_rx_skb().
+ */
+static inline struct sk_buff *bpf_net_ctx_set_rx_skb(struct sk_buff *skb)
+{
+	struct bpf_net_context *bpf_net_ctx = bpf_net_ctx_get();
+	struct sk_buff *prev = NULL;
+
+	if (bpf_net_ctx->ri.kern_flags & BPF_RI_F_RX_SKB)
+		prev = bpf_net_ctx->rx_skb;
+	bpf_net_ctx->rx_skb = skb;
+	bpf_net_ctx->ri.kern_flags |= BPF_RI_F_RX_SKB;
+	return prev;
+}
+
+static inline void bpf_net_ctx_restore_rx_skb(struct sk_buff *prev)
+{
+	struct bpf_net_context *bpf_net_ctx = bpf_net_ctx_get();
+
+	bpf_net_ctx->rx_skb = prev;
+	if (!prev)
+		bpf_net_ctx->ri.kern_flags &= ~BPF_RI_F_RX_SKB;
+}
+
+static inline bool bpf_net_ctx_is_rx_skb(const struct sk_buff *skb)
+{
+	struct bpf_net_context *bpf_net_ctx = bpf_net_ctx_get();
+
+	return bpf_net_ctx &&
+	       (bpf_net_ctx->ri.kern_flags & BPF_RI_F_RX_SKB) &&
+	       bpf_net_ctx->rx_skb == skb;
 }
 
 static inline void bpf_net_ctx_get_all_used_flush_lists(struct list_head **lh_map,

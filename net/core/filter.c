@@ -8013,21 +8013,33 @@ static const struct bpf_func_proto bpf_tcp_gen_syncookie_proto = {
 
 BPF_CALL_3(bpf_sk_assign, struct sk_buff *, skb, struct sock *, sk, u64, flags)
 {
+	bool hold;
+
 	if (!sk || flags != 0)
 		return -EINVAL;
-	if (!skb_at_tc_ingress(skb))
+	/* At tc ingress, the skb reaches the socket within the RCU read-side
+	 * section the socket was looked up in. An rx skb may instead be
+	 * queued to the backlog first, so a reference must be held even for
+	 * sockets which are not refcounted.
+	 */
+	if (skb_at_tc_ingress(skb))
+		hold = false;
+	else if (bpf_net_ctx_is_rx_skb(skb))
+		hold = true;
+	else
 		return -EOPNOTSUPP;
 	if (unlikely(dev_net(skb->dev) != sock_net(sk)))
 		return -ENETUNREACH;
 	if (sk_unhashed(sk))
 		return -EOPNOTSUPP;
-	if (sk_is_refcounted(sk) &&
+	if ((hold || sk_is_refcounted(sk)) &&
 	    unlikely(!refcount_inc_not_zero(&sk->sk_refcnt)))
 		return -ENOENT;
 
 	skb_orphan(skb);
 	skb->sk = sk;
-	skb->destructor = sock_pfree;
+	skb->destructor = hold && !sk_is_refcounted(sk) ?
+			  sock_pfree_held : sock_pfree;
 
 	return 0;
 }
